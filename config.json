@@ -1,0 +1,5 @@
+{
+    "netuids": "all",
+    "network": "finney",
+    "check_interval_seconds": 3600
+}
