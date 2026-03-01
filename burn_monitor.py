@@ -1,273 +1,226 @@
-#!/usr/bin/env python3
-"""
-Bittensor Subnet Burn Rate Monitor
-Monitors burn rate changes and sends notifications via Telegram.
+"""Bittensor subnet incentive burn monitor — hourly Telegram reports.
+
+Fetches all subnet data from the taostats.io API every hour.
+Reports subnets NOT at 100% incentive burn, sorted by ascending burn rate.
+Tracks burn rate changes between checks using a local JSON file.
 """
 
 import json
 import os
 import time
 import logging
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from datetime import datetime
-from typing import Optional
 
-import bittensor as bt
 import requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("burn_monitor")
 
+# ---------------------------------------------------------------------------
 # Configuration
-CONFIG_FILE = Path(__file__).parent / "config.json"
+# ---------------------------------------------------------------------------
+TAOSTATS_API = "https://taostats.io/api/dtao/dtaoSubnets"
+METAGRAPH_URL = "https://taostats.io/subnets/{netuid}/metagraph"
 DATA_FILE = Path(__file__).parent / "burn_data.json"
+CHECK_INTERVAL = 3600  # 1 hour
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+JST = timezone(timedelta(hours=9))
 
 
-def load_config() -> dict:
-    """Load configuration from config.json and environment variables"""
-    if not CONFIG_FILE.exists():
-        raise FileNotFoundError(
-            f"Config file not found: {CONFIG_FILE}\n"
-            "Please create config.json with your configuration."
-        )
-    
-    with open(CONFIG_FILE, 'r') as f:
-        config = json.load(f)
-    
-    # Load Telegram credentials from environment variables
-    config['telegram_bot_token'] = os.getenv('TELEGRAM_BOT_TOKEN')
-    config['telegram_chat_id'] = os.getenv('TELEGRAM_CHAT_ID')
-    
-    if not config['telegram_bot_token']:
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN in .env file")
-    if not config['telegram_chat_id']:
-        raise ValueError("Missing TELEGRAM_CHAT_ID in .env file")
-    
-    if 'netuids' not in config:
-        raise ValueError("Missing required config key: netuids")
-    
-    return config
-
-
-def load_burn_data() -> dict:
-    """Load previous burn data from local JSON file"""
-    if not DATA_FILE.exists():
-        return {"subnets": {}}
-    
-    with open(DATA_FILE, 'r') as f:
-        return json.load(f)
-
-
-def save_burn_data(data: dict) -> None:
-    """Save burn data to local JSON file"""
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-
-def rao_to_tao(rao: int) -> float:
-    """Convert RAO to TAO (1 TAO = 10^9 RAO)"""
-    return rao / 1e9
-
-
-def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
-    """Send a message via Telegram bot"""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def load_data() -> dict:
+    """Load previous snapshot from JSON file."""
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        logger.info("Telegram notification sent successfully")
-        return True
-    except requests.RequestException as e:
-        logger.error(f"Failed to send Telegram message: {e}")
-        return False
-
-
-def format_burn_change_message(
-    netuid: int,
-    old_burn: float,
-    new_burn: float,
-    emission: float,
-    subnet_name: str = None
-) -> str:
-    """Format the burn rate change notification message"""
-    change = new_burn - old_burn
-    change_percent = (change / old_burn * 100) if old_burn > 0 else 0
-    direction = "🔺" if change > 0 else "🔻"
-    
-    subnet_label = f"Subnet {netuid}"
-    if subnet_name:
-        subnet_label = f"{subnet_name} (SN{netuid})"
-    
-    message = f"""
-<b>🔥 Burn Rate Changed - {subnet_label}</b>
-
-{direction} <b>Burn Rate Update</b>
-├ Previous: <code>{old_burn:.4f} τ</code>
-├ Current: <code>{new_burn:.4f} τ</code>
-├ Change: <code>{change:+.4f} τ</code> ({change_percent:+.2f}%)
-└ Emission: <code>{emission:.4f} τ/block</code>
-
-⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
-"""
-    return message.strip()
-
-
-def get_all_netuids(subtensor: bt.subtensor) -> list:
-    """Get all active subnet netuids from the network"""
-    try:
-        subnets = subtensor.get_all_subnets_info()
-        if subnets:
-            return sorted([s.netuid for s in subnets if s is not None])
-        return []
+        if DATA_FILE.exists():
+            with open(DATA_FILE) as f:
+                return json.load(f)
     except Exception as e:
-        logger.error(f"Error getting all netuids: {e}")
-        return []
+        log.error("Failed to load data file: %s", e)
+    return {}
 
 
-def get_subnet_burn_info(subtensor: bt.subtensor, netuid: int) -> Optional[dict]:
-    """Get burn rate and emission info for a subnet"""
+def save_data(data: dict):
+    """Persist current snapshot to JSON file."""
     try:
-        subnet_info = subtensor.get_subnet_info(netuid)
-        if subnet_info is None:
-            logger.warning(f"Subnet {netuid} not found")
-            return None
-        
-        burn_rao = subtensor.burn(netuid=netuid)
-        burn_tao = rao_to_tao(burn_rao.rao if hasattr(burn_rao, 'rao') else int(burn_rao))
-        
-        emission_value = subnet_info.emission_value
-        emission_tao = rao_to_tao(emission_value) if emission_value else 0
-        
-        return {
-            "netuid": netuid,
-            "burn_tao": burn_tao,
-            "emission_tao": emission_tao,
-            "timestamp": datetime.utcnow().isoformat()
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.error("Failed to save data file: %s", e)
+
+
+def fetch_subnets() -> list[dict]:
+    """Fetch all subnets from the taostats API (single call)."""
+    log.info("Fetching subnet data from taostats API …")
+    resp = requests.get(TAOSTATS_API, timeout=60)
+    resp.raise_for_status()
+    payload = resp.json()
+    subnets = payload.get("data", [])
+    log.info("Fetched %d subnets", len(subnets))
+    return subnets
+
+
+def build_snapshot(subnets: list[dict]) -> dict:
+    """Build a {netuid: info} snapshot from raw API data."""
+    snap: dict = {}
+    for s in subnets:
+        netuid = int(s["netuid"])
+        burn = float(s.get("incentive_burn", 0))
+        name = s.get("subnet_name") or s.get("name") or f"SN{netuid}"
+        snap[str(netuid)] = {
+            "incentive_burn": burn,
+            "name": name,
         }
-    except Exception as e:
-        logger.error(f"Error getting burn info for subnet {netuid}: {e}")
-        return None
+    return snap
 
 
-def monitor_burn_rates(config: dict, run_once: bool = False) -> None:
-    """Main monitoring loop"""
-    bot_token = config['telegram_bot_token']
-    chat_id = config['telegram_chat_id']
-    netuids_config = config['netuids']
-    network = config.get('network', 'finney')
-    check_interval = config.get('check_interval_seconds', 3600)  # Default 1 hour
-    
-    logger.info(f"Connecting to Bittensor network: {network}")
-    subtensor = bt.subtensor(network=network)
-    
-    # Get netuids - either from config or all available
-    if netuids_config == "all":
-        netuids = get_all_netuids(subtensor)
-        logger.info(f"Monitoring ALL subnets: {netuids}")
-    else:
-        netuids = netuids_config
-        logger.info(f"Monitoring subnets: {netuids}")
-    
-    while True:
-        burn_data = load_burn_data()
-        
-        # Refresh netuids list each iteration when monitoring all
-        if netuids_config == "all":
-            netuids = get_all_netuids(subtensor)
-            logger.info(f"Found {len(netuids)} active subnets")
-        
-        for netuid in netuids:
-            netuid_str = str(netuid)
-            
-            info = get_subnet_burn_info(subtensor, netuid)
-            if info is None:
-                continue
-            
-            current_burn = info['burn_tao']
-            emission = info['emission_tao']
-            
-            # Check if burn rate changed
-            if netuid_str in burn_data['subnets']:
-                previous_burn = burn_data['subnets'][netuid_str].get('burn_tao', 0)
-                
-                # Only notify if burn rate actually changed
-                if abs(current_burn - previous_burn) > 0.0001:  # Small threshold to avoid float noise
-                    logger.info(f"Subnet {netuid} burn changed: {previous_burn:.4f} -> {current_burn:.4f}")
-                    
-                    message = format_burn_change_message(
-                        netuid=netuid,
-                        old_burn=previous_burn,
-                        new_burn=current_burn,
-                        emission=emission
-                    )
-                    send_telegram_message(bot_token, chat_id, message)
+def not_full_burn(snap: dict) -> list[tuple[int, dict]]:
+    """Return subnets where incentive_burn < 1, sorted by ascending burn rate."""
+    items = []
+    for nid, info in snap.items():
+        if float(info["incentive_burn"]) < 1.0:
+            items.append((int(nid), info))
+    items.sort(key=lambda x: x[1]["incentive_burn"])
+    return items
+
+
+def format_burn_pct(val: float) -> str:
+    """Format burn rate as a readable percentage string."""
+    pct = val * 100
+    if pct == 0:
+        return "0%"
+    if pct >= 99.995:
+        return "100%"
+    if pct >= 10:
+        return f"{pct:.1f}%"
+    return f"{pct:.2f}%"
+
+
+def build_report(snap: dict, prev_snap: dict) -> str:
+    """Build the Telegram report message."""
+    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+    items = not_full_burn(snap)
+
+    total_subnets = len(snap)
+    full_burn = total_subnets - len(items)
+
+    lines: list[str] = []
+    lines.append("🔥 <b>Burn Rate Report</b>")
+    lines.append(f"📅 {now}")
+    lines.append(f"✅ Full burn (100%): {full_burn}/{total_subnets}")
+    lines.append(f"⚠️ Not full burn: {len(items)} subnets\n")
+    for netuid, info in items:
+        burn = info["incentive_burn"]
+        name = info.get("name", f"SN{netuid}")
+        link = METAGRAPH_URL.format(netuid=netuid)
+
+        # Compute change from previous snapshot
+        prev = prev_snap.get(str(netuid))
+        if prev is not None:
+            old_burn = float(prev.get("incentive_burn", prev.get("burn_rate", 0)))
+            delta = burn - old_burn
+            if abs(delta) < 0.00005:
+                delta_str = "—"
+            elif delta > 0:
+                delta_str = f"🔺+{delta*100:.2f}%"
             else:
-                # First time seeing this subnet, just log it
-                logger.info(f"Initial burn rate for subnet {netuid}: {current_burn:.4f} TAO")
-            
-            # Update stored data
-            burn_data['subnets'][netuid_str] = {
-                'burn_tao': current_burn,
-                'emission_tao': emission,
-                'last_updated': info['timestamp']
-            }
-        
-        # Save updated data
-        save_burn_data(burn_data)
-        
-        if run_once:
-            break
-        
-        logger.info(f"Sleeping for {check_interval} seconds...")
-        time.sleep(check_interval)
+                delta_str = f"🔻{delta*100:.2f}%"
+        else:
+            delta_str = "🆕"
+
+        lines.append(f'SN{netuid} <a href="{link}">{name}</a> {format_burn_pct(burn)} {delta_str}')
+
+    # Summary of biggest movers (burn rate changed since last check)
+    movers = []
+    for nid, info in snap.items():
+        prev = prev_snap.get(nid)
+        if prev is not None:
+            old_burn = float(prev.get("incentive_burn", prev.get("burn_rate", 0)))
+            delta = float(info["incentive_burn"]) - old_burn
+            if abs(delta) > 0.0001:
+                name = info.get("name", f"SN{nid}")
+                movers.append((int(nid), name, delta))
+
+    if movers:
+        movers.sort(key=lambda x: x[2])
+        lines.append("\n📊 Burn rate changes (1h):")
+        for nid, name, delta in movers:
+            direction = "🔺" if delta > 0 else "🔻"
+            lines.append(f"  {direction} SN{nid} {name}: {delta*100:+.2f}%")
+
+    return "\n".join(lines)
+
+
+def send_telegram(text: str):
+    """Send a message via Telegram Bot API."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials not set — printing report to stdout")
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        if resp.status_code == 200:
+            log.info("Telegram report sent successfully")
+        else:
+            log.error("Telegram API error %d: %s", resp.status_code, resp.text)
+    except Exception as e:
+        log.error("Failed to send Telegram message: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def run_once(prev_snap: dict) -> dict:
+    """Fetch data, build report, send Telegram, return new snapshot."""
+    subnets = fetch_subnets()
+    snap = build_snapshot(subnets)
+
+    report = build_report(snap, prev_snap)
+    send_telegram(report)
+
+    save_data({
+        "last_check": datetime.now(JST).isoformat(),
+        "subnets": snap,
+    })
+
+    return snap
 
 
 def main():
-    """Entry point"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Monitor Bittensor subnet burn rates')
-    parser.add_argument('--once', action='store_true', help='Run once and exit')
-    parser.add_argument('--test', action='store_true', help='Send a test notification')
-    args = parser.parse_args()
-    
-    config = load_config()
-    
-    if args.test:
-        # Send test notification
-        message = "🧪 <b>Test Notification</b>\n\nBurn rate monitor is configured correctly!"
-        success = send_telegram_message(
-            config['telegram_bot_token'],
-            config['telegram_chat_id'],
-            message
-        )
-        if success:
-            print("✅ Test notification sent successfully!")
-        else:
-            print("❌ Failed to send test notification")
-        return
-    
-    try:
-        monitor_burn_rates(config, run_once=args.once)
-    except KeyboardInterrupt:
-        logger.info("Monitoring stopped by user")
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        raise
+    """Entry point — run every CHECK_INTERVAL seconds."""
+    log.info("Burn monitor started (interval=%ds)", CHECK_INTERVAL)
+
+    stored = load_data()
+    prev_snap = stored.get("subnets", {})
+
+    while True:
+        try:
+            prev_snap = run_once(prev_snap)
+        except Exception as e:
+            log.error("Error in check cycle: %s", e)
+
+        log.info("Sleeping %ds until next check …", CHECK_INTERVAL)
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":

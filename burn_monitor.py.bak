@@ -1,0 +1,438 @@
+"""Bittensor subnet incentive burn rate monitor from taostats.io."""
+
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+import httpx
+import structlog
+
+logger = structlog.get_logger()
+
+# Taostats subnets page (contains all subnet data including incentive burn)
+TAOSTATS_SUBNETS_URL = "https://taostats.io/subnets/"
+# Individual subnet page template
+TAOSTATS_SUBNET_URL = "https://taostats.io/subnets/{netuid}/metagraph"
+
+BURN_DATA_FILE = "burn_data.json"
+
+
+class BurnMonitor:
+    """Monitor incentive burn rates for Bittensor subnets from taostats.io."""
+
+    def __init__(self, data_file: str = BURN_DATA_FILE):
+        self.data_file = Path(data_file)
+        self._burn_data: Dict[str, Dict[str, Any]] = {}
+        self._load_existing_data()
+
+    def _load_existing_data(self):
+        """Load previously saved burn data."""
+        try:
+            if self.data_file.exists():
+                with open(self.data_file) as f:
+                    data = json.load(f)
+                self._burn_data = data.get("subnets", {})
+                logger.info("Loaded existing burn data", count=len(self._burn_data))
+        except Exception as e:
+            logger.error("Failed to load burn data", error=str(e))
+            self._burn_data = {}
+
+    def _save_data(self):
+        """Save burn data to file."""
+        try:
+            output = {
+                "subnets": self._burn_data,
+                "last_updated": datetime.now().isoformat(),
+            }
+            with open(self.data_file, "w") as f:
+                json.dump(output, f, indent=2)
+            logger.info("Saved burn data", count=len(self._burn_data))
+        except Exception as e:
+            logger.error("Failed to save burn data", error=str(e))
+
+    async def fetch_all_burn_rates(self) -> Dict[str, Dict[str, Any]]:
+        """Fetch incentive burn rates for all subnets from taostats.io subnets page.
+
+        Returns dict mapping netuid (str) to burn rate info.
+        """
+        logger.info("Fetching incentive burn rates from taostats.io")
+
+        # Strategy 1: Parse the main subnets list page
+        result = await self._fetch_from_subnets_page()
+
+        if result:
+            self._burn_data = result
+            self._save_data()
+        else:
+            logger.warning("Failed to fetch from subnets page, data unchanged")
+
+        return self._burn_data
+
+    async def fetch_burn_rate(self, netuid: int) -> Optional[Dict[str, Any]]:
+        """Fetch incentive burn rate for a single subnet.
+
+        Args:
+            netuid: The subnet network UID.
+
+        Returns:
+            Dict with burn rate info or None if unavailable.
+        """
+        logger.info("Fetching burn rate for subnet", netuid=netuid)
+        result = await self._fetch_from_subnet_page(netuid)
+
+        if result is not None:
+            self._burn_data[str(netuid)] = result
+            self._save_data()
+
+        return result
+
+    async def _fetch_from_subnets_page(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Scrape incentive burn rates from the main taostats.io/subnets page.
+
+        The subnets table contains a row per subnet with columns including
+        the incentive burn percentage.
+        """
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    TAOSTATS_SUBNETS_URL,
+                    headers=headers,
+                    follow_redirects=True,
+                    timeout=60,
+                )
+
+                if response.status_code != 200:
+                    logger.error("Failed to fetch subnets page", status=response.status_code)
+                    return None
+
+                html = response.text
+                return self._parse_subnets_page(html)
+
+        except Exception as e:
+            logger.error("Failed to scrape subnets page", error=str(e))
+            return None
+
+    def _parse_subnets_page(self, html: str) -> Dict[str, Dict[str, Any]]:
+        """Parse the subnets page HTML to extract incentive burn rates.
+
+        Each table row contains subnet data including the SN{netuid} identifier
+        and the incentive burn percentage. The page uses Next.js, so we look for
+        data both in __NEXT_DATA__ JSON and in the rendered HTML.
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+
+        # Strategy 1: Try to find __NEXT_DATA__ JSON payload
+        next_data = self._try_parse_next_data(html)
+        if next_data:
+            return next_data
+
+        # Strategy 2: Parse rendered HTML table rows
+        # Each subnet row contains "SN{number}" and various data fields.
+        # We look for patterns like: SN10 ... 100.00% (incentive burn)
+        #
+        # The table structure per row has these approximate columns:
+        #   Rank | Name (with SNxx) | Emission% | Price | 1h% | 24h% | 7d% | 30d% |
+        #   MarketCap | Volume24h | Vol/MC% | NetFlow1h | NetFlow24h | NetFlow30d |
+        #   Burned24h | IncentiveBurn% | Stake | ... | Ratio | RootProp% | ...
+        #
+        # We extract netuid from "SN(\d+)" and incentive burn from the column after burned24h.
+
+        # Find all subnet references with their surrounding context
+        # Look for table rows containing SN identifiers
+        subnet_pattern = re.compile(
+            r'SN(\d+).*?'                    # Subnet ID
+            r'(\d+\.?\d*)\s*%\s*'            # Emission %
+            r'.*?'                            # Price and change columns
+            r'(?:Bittensor\s+[\d,.]+K?\s+)'   # Burned24h amount
+            r'(\d+\.?\d*)\s*%',              # Incentive Burn %
+            re.DOTALL
+        )
+
+        # Alternative: scan for each SN and then find nearby percentage values
+        sn_pattern = re.compile(r'SN(\d+)')
+        sn_matches = list(sn_pattern.finditer(html))
+
+        for i, match in enumerate(sn_matches):
+            netuid = match.group(1)
+            # Get context after this SN reference (up to next SN or 3000 chars)
+            start = match.end()
+            end = sn_matches[i + 1].start() if i + 1 < len(sn_matches) else start + 3000
+            context = html[start:end]
+
+            # Find all percentage values in this row's context
+            pct_values = re.findall(r'(\d+\.?\d*)\s*%', context)
+
+            # In the subnets table, the incentive burn % appears after several
+            # other percentage columns. Based on the table structure, it's
+            # typically the value after the burned-24h TAO amount.
+            # We look for a percentage that comes after a "Bittensor" token amount
+            # pattern, specifically: Bittensor {number} followed by percentage
+            burn_pct = self._extract_incentive_burn_from_context(context)
+
+            if burn_pct is not None:
+                results[netuid] = {
+                    "burn_rate": burn_pct,
+                    "last_updated": datetime.now().isoformat(),
+                }
+                logger.debug("Parsed burn rate", netuid=netuid, burn_rate=burn_pct)
+
+        if results:
+            logger.info("Parsed burn rates from subnets page", count=len(results))
+        else:
+            logger.warning("No burn rates found on subnets page")
+
+        return results
+
+    def _extract_incentive_burn_from_context(self, context: str) -> Optional[float]:
+        """Extract the incentive burn percentage from a subnet row's context.
+
+        The incentive burn % in the taostats table appears as a standalone
+        percentage value. We look for the pattern where a TAO amount (the burned
+        24h value) is followed by a percentage (the incentive burn rate).
+        """
+        # Pattern: a TAO amount (like "9.3564" or "0") followed by a percentage
+        # This matches the Burned24h column value followed by IncentiveBurn%
+        # The Burned24h value may include decimals and is preceded by "Bittensor"
+        burn_match = re.search(
+            r'(?:Bittensor|τ|tao)\s*'     # Token indicator
+            r'[\d,]+\.?\d*\s*'             # Burned amount
+            r'[^%]*?'                       # Possible separator
+            r'(\d+\.?\d*)\s*%',            # Incentive burn percentage
+            context,
+            re.IGNORECASE
+        )
+        if burn_match:
+            try:
+                return float(burn_match.group(1))
+            except ValueError:
+                pass
+
+        return None
+
+    def _try_parse_next_data(self, html: str) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Try to extract burn rate data from Next.js __NEXT_DATA__ script tag."""
+        try:
+            next_data_match = re.search(
+                r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
+                html,
+                re.DOTALL,
+            )
+            if not next_data_match:
+                return None
+
+            data = json.loads(next_data_match.group(1))
+            # Navigate the Next.js data structure to find subnet info
+            # This structure varies by page version, so we search broadly
+            return self._extract_burn_from_next_data(data)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.debug("Could not parse __NEXT_DATA__", error=str(e))
+            return None
+
+    def _extract_burn_from_next_data(self, data: dict) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Recursively search Next.js data for incentive burn information."""
+        results: Dict[str, Dict[str, Any]] = {}
+
+        def search(obj, path=""):
+            if isinstance(obj, dict):
+                # Look for subnet-like objects with burn rate fields
+                netuid = obj.get("netuid") or obj.get("net_uid") or obj.get("subnet_id")
+                burn = (
+                    obj.get("incentive_burn")
+                    or obj.get("incentiveBurn")
+                    or obj.get("burn_rate")
+                    or obj.get("burnRate")
+                    or obj.get("incentive_burn_pct")
+                )
+                if netuid is not None and burn is not None:
+                    try:
+                        burn_val = float(burn)
+                        # Normalize: if it's a fraction (0-1), convert to percentage
+                        if 0 <= burn_val <= 1:
+                            burn_val *= 100
+                        results[str(netuid)] = {
+                            "burn_rate": burn_val,
+                            "last_updated": datetime.now().isoformat(),
+                        }
+                    except (ValueError, TypeError):
+                        pass
+
+                for v in obj.values():
+                    search(v, path)
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    search(item, path)
+
+        search(data)
+        return results if results else None
+
+    async def _fetch_from_subnet_page(self, netuid: int) -> Optional[Dict[str, Any]]:
+        """Fetch incentive burn rate from an individual subnet page.
+
+        Each subnet page at taostats.io/subnets/{netuid}/metagraph has a
+        clearly labeled "Incentive Burn" field in its SUBNET DATA section.
+        """
+        url = TAOSTATS_SUBNET_URL.format(netuid=netuid)
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    url,
+                    headers=headers,
+                    follow_redirects=True,
+                    timeout=60,
+                )
+
+                if response.status_code != 200:
+                    logger.error(
+                        "Failed to fetch subnet page",
+                        netuid=netuid,
+                        status=response.status_code,
+                    )
+                    return None
+
+                html = response.text
+                return self._parse_subnet_page(html, netuid)
+
+        except Exception as e:
+            logger.error("Failed to fetch subnet page", netuid=netuid, error=str(e))
+            return None
+
+    def _parse_subnet_page(self, html: str, netuid: int) -> Optional[Dict[str, Any]]:
+        """Parse an individual subnet page for incentive burn rate.
+
+        Looks for the "Incentive Burn" label followed by a percentage value.
+        """
+        # Match "Incentive Burn" followed by a percentage value
+        patterns = [
+            r'Incentive\s+Burn[^%]*?(\d+\.?\d*)\s*%',
+            r'incentive.?burn["\s:]+(\d+\.?\d*)\s*%',
+            r'incentiveBurn["\s:]+(\d+\.?\d*)',
+            r'"incentive_burn"\s*:\s*"?(\d+\.?\d*)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+            if match:
+                try:
+                    burn_rate = float(match.group(1))
+                    logger.info(
+                        "Found incentive burn rate",
+                        netuid=netuid,
+                        burn_rate=burn_rate,
+                    )
+                    return {
+                        "burn_rate": burn_rate,
+                        "last_updated": datetime.now().isoformat(),
+                    }
+                except ValueError:
+                    continue
+
+        # Also try __NEXT_DATA__
+        next_data = self._try_parse_next_data(html)
+        if next_data and str(netuid) in next_data:
+            return next_data[str(netuid)]
+
+        logger.warning("Could not find incentive burn rate", netuid=netuid)
+        return None
+
+    async def fetch_multiple_burn_rates(self, netuids: List[int]) -> Dict[str, Dict[str, Any]]:
+        """Fetch incentive burn rates for specific subnets by scraping individual pages.
+
+        Use this when the bulk subnets page parsing fails or you only need
+        specific subnets. Each subnet is fetched from its individual page.
+
+        Args:
+            netuids: List of subnet UIDs to fetch.
+
+        Returns:
+            Dict mapping netuid (str) to burn rate info.
+        """
+        logger.info("Fetching burn rates for specific subnets", count=len(netuids))
+
+        for netuid in netuids:
+            result = await self._fetch_from_subnet_page(netuid)
+            if result is not None:
+                self._burn_data[str(netuid)] = result
+
+        self._save_data()
+        return {k: v for k, v in self._burn_data.items() if k in [str(n) for n in netuids]}
+
+    def get_burn_data(self) -> Dict[str, Dict[str, Any]]:
+        """Get currently loaded burn rate data."""
+        return self._burn_data
+
+    def get_burn_rate(self, netuid: int) -> Optional[float]:
+        """Get the burn rate for a specific subnet."""
+        data = self._burn_data.get(str(netuid))
+        return data["burn_rate"] if data else None
+
+    def get_changed_burn_rates(
+        self, new_data: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Compare new burn data with stored data and return changes.
+
+        Returns dict of netuids where burn rate changed, with both old and new values.
+        """
+        changes: Dict[str, Dict[str, Any]] = {}
+
+        for netuid, new_info in new_data.items():
+            old_info = self._burn_data.get(netuid)
+            new_rate = new_info.get("burn_rate")
+
+            if old_info is None:
+                changes[netuid] = {
+                    "old_rate": None,
+                    "new_rate": new_rate,
+                    "change": "new",
+                }
+            elif old_info.get("burn_rate") != new_rate:
+                changes[netuid] = {
+                    "old_rate": old_info["burn_rate"],
+                    "new_rate": new_rate,
+                    "change": new_rate - old_info["burn_rate"],
+                }
+
+        return changes
+
+
+async def main():
+    """Run burn monitor as a standalone script."""
+    import asyncio
+
+    monitor = BurnMonitor()
+
+    # Try bulk fetch first
+    print("Fetching all subnet incentive burn rates from taostats.io...")
+    data = await monitor.fetch_all_burn_rates()
+
+    if data:
+        print(f"\nFound burn rates for {len(data)} subnets:")
+        for netuid in sorted(data.keys(), key=lambda x: int(x)):
+            info = data[netuid]
+            print(f"  SN{netuid}: {info['burn_rate']}%")
+    else:
+        # Fall back to fetching a few individual subnets
+        print("\nBulk fetch returned no results. Trying individual subnet pages...")
+        sample_netuids = [1, 3, 4, 5, 8, 9, 10, 12, 13, 14]
+        data = await monitor.fetch_multiple_burn_rates(sample_netuids)
+        if data:
+            print(f"\nFound burn rates for {len(data)} subnets:")
+            for netuid in sorted(data.keys(), key=lambda x: int(x)):
+                info = data[netuid]
+                print(f"  SN{netuid}: {info['burn_rate']}%")
+        else:
+            print("Could not fetch burn rate data.")
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
