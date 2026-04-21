@@ -27,11 +27,13 @@ log = logging.getLogger("burn_monitor")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-TAOSTATS_API = "https://taostats.io/api/dtao/dtaoSubnets"
+TAOSTATS_API = "https://api.taostats.io/api/subnet/latest/v1"
+TAOSTATS_IDENTITY_API = "https://api.taostats.io/api/subnet/identity/v1"
 METAGRAPH_URL = "https://taostats.io/subnets/{netuid}/metagraph"
 DATA_FILE = Path(__file__).parent / "burn_data.json"
 CHECK_INTERVAL = 3600  # 1 hour
 
+TAOSTATS_API_KEY = os.getenv("TAOSTATS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -64,7 +66,8 @@ def save_data(data: dict):
 def fetch_subnets() -> list[dict]:
     """Fetch all subnets from the taostats API (single call)."""
     log.info("Fetching subnet data from taostats API …")
-    resp = requests.get(TAOSTATS_API, timeout=60)
+    headers = {"Authorization": TAOSTATS_API_KEY} if TAOSTATS_API_KEY else {}
+    resp = requests.get(TAOSTATS_API, headers=headers, params={"per_page": 1024}, timeout=60)
     resp.raise_for_status()
     payload = resp.json()
     subnets = payload.get("data", [])
@@ -72,13 +75,27 @@ def fetch_subnets() -> list[dict]:
     return subnets
 
 
-def build_snapshot(subnets: list[dict]) -> dict:
+def fetch_subnet_names() -> dict[int, str]:
+    """Fetch subnet names from the identity endpoint. Returns {netuid: name}."""
+    headers = {"Authorization": TAOSTATS_API_KEY} if TAOSTATS_API_KEY else {}
+    resp = requests.get(TAOSTATS_IDENTITY_API, headers=headers, params={"per_page": 1024}, timeout=60)
+    resp.raise_for_status()
+    names: dict[int, str] = {}
+    for entry in resp.json().get("data", []):
+        netuid = int(entry["netuid"])
+        name = entry.get("subnet_name") or ""
+        if name:
+            names[netuid] = name
+    return names
+
+
+def build_snapshot(subnets: list[dict], names: dict[int, str]) -> dict:
     """Build a {netuid: info} snapshot from raw API data."""
     snap: dict = {}
     for s in subnets:
         netuid = int(s["netuid"])
         burn = float(s.get("incentive_burn", 0))
-        name = s.get("subnet_name") or s.get("name") or f"SN{netuid}"
+        name = names.get(netuid) or f"SN{netuid}"
         snap[str(netuid)] = {
             "incentive_burn": burn,
             "name": name,
@@ -193,7 +210,8 @@ def send_telegram(text: str):
 def run_once(prev_snap: dict) -> dict:
     """Fetch data, build report, send Telegram, return new snapshot."""
     subnets = fetch_subnets()
-    snap = build_snapshot(subnets)
+    names = fetch_subnet_names()
+    snap = build_snapshot(subnets, names)
 
     report = build_report(snap, prev_snap)
     send_telegram(report)
