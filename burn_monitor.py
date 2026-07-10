@@ -15,6 +15,9 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+import subnet_info
+import telegram_bot
+
 load_dotenv()
 
 logging.basicConfig(
@@ -227,6 +230,12 @@ def run_once(prev_snap: dict) -> dict:
 def main():
     """Entry point — run every CHECK_INTERVAL seconds."""
     log.info("Burn monitor started (interval=%ds)", CHECK_INTERVAL)
+
+    # Serves on-demand /subnet queries from a TTL cache, so user traffic never
+    # multiplies into taostats API calls.
+    cache = subnet_info.SubnetCache()
+    if telegram_bot.start_in_background(cache):
+        log.info("Subnet info bot listening for queries")
 
     stored = load_data()
     prev_snap = stored.get("subnets", {})
